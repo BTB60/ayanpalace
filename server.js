@@ -60,23 +60,40 @@ function presentProduct(row) {
   if (has) copy.image_url = `/api/images/${copy.id}`;
   return copy;
 }
-async function translateLine(value, source, target) {
-  const google = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=" + encodeURIComponent(source) + "&tl=" + encodeURIComponent(target) + "&dt=t&q=" + encodeURIComponent(value);
-  try {
-    const response = await fetch(google);
-    if (response.ok) {
-      const data = await response.json();
-      const out = (data[0] || []).map((part) => part && part[0]).join("").trim();
-      if (out) return out.slice(0, 1000);
-    }
-  } catch (error) { console.error("Google translate failed", error); }
+async function googleTranslate(url) {
+  const response = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!response.ok) throw new Error("Google status " + response.status);
+  const data = await response.json();
+  const out = (data[0] || []).map((part) => part && part[0]).join("").trim();
+  if (!out) throw new Error("Google boş cavab qaytardı.");
+  return out.slice(0, 1000);
+}
+async function memoryTranslate(value, source, target) {
   const memory = "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(value) + "&langpair=" + encodeURIComponent(source + "|" + target);
-  const response = await fetch(memory);
-  if (!response.ok) throw new Error("Tərcümə alınmadı.");
+  const response = await fetch(memory, { signal: AbortSignal.timeout(8000) });
+  if (!response.ok) throw new Error("MyMemory status " + response.status);
   const data = await response.json();
   const out = data.responseData && data.responseData.translatedText;
-  if (!out || /INVALID|QUERY LENGTH|MYMEMORY WARNING/i.test(out)) throw new Error("Tərcümə alınmadı.");
+  if (!out || /INVALID|QUERY LENGTH|MYMEMORY WARNING/i.test(out)) throw new Error("MyMemory limit.");
   return String(out).slice(0, 1000);
+}
+async function translateLine(value, source, target) {
+  const q = encodeURIComponent(value);
+  const pair = "sl=" + encodeURIComponent(source) + "&tl=" + encodeURIComponent(target) + "&dt=t&q=" + q;
+  const attempts = [
+    () => googleTranslate("https://translate.googleapis.com/translate_a/single?client=gtx&" + pair),
+    () => googleTranslate("https://clients5.google.com/translate_a/single?client=dict-chrome-ex&" + pair),
+    () => memoryTranslate(value, source, target)
+  ];
+  let last = new Error("Tərcümə alınmadı.");
+  for (const attempt of attempts) {
+    try { return await attempt(); }
+    catch (error) { last = error; console.error("Translate attempt failed", source, target, error.message); }
+  }
+  throw last;
 }
 function productInput(b) {
   const price = Number(b.price);
@@ -121,16 +138,13 @@ app.post("/api/admin/translate", translateLimiter, auth, async (req, res) => {
   const value = text(req.body.text, 1000);
   const source = text(req.body.source, 2);
   if (!value || !LANGS.includes(source)) return res.status(400).json({ error: "Tərcümə üçün mətn lazımdır." });
-  try {
-    const translations = { [source]: value };
-    await Promise.all(LANGS.filter((code) => code !== source).map(async (code) => {
-      translations[code] = await translateLine(value, source, code);
-    }));
-    res.json({ translations });
-  } catch (error) {
-    console.error(error);
-    res.status(502).json({ error: "Avtomatik tərcümə alınmadı. Digər dilləri əl ilə yaza bilərsiniz." });
+  const translations = { [source]: value };
+  for (const code of LANGS.filter((item) => item !== source)) {
+    try { translations[code] = await translateLine(value, source, code); }
+    catch (error) { console.error(error); }
   }
+  if (Object.keys(translations).length < 2) return res.status(502).json({ error: "Avtomatik tərcümə alınmadı. Digər dilləri əl ilə yaza bilərsiniz." });
+  res.json({ translations });
 });
 app.get("/api/images/:id", async (req, res) => {
   try {
